@@ -2,18 +2,77 @@
  * IMAP client wrapper for iCloud Mail
  */
 
+const net = require('net');
 const Imap = require('imap');
 const { simpleParser } = require('mailparser');
 const config = require('../config');
 const { getCredentials } = require('../auth');
 
+// Node emits this exact text from tls.connect when the socket ends before
+// the handshake is marked secure. It is not an authentication result.
+const TLS_EOF_BEFORE_SECURE =
+  'Client network socket disconnected before secure TLS connection was established';
+
+const TLS_CERT_CODES = new Set([
+  'DEPTH_ZERO_SELF_SIGNED_CERT',
+  'SELF_SIGNED_CERT_IN_CHAIN',
+  'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+  'UNABLE_TO_GET_ISSUER_CERT',
+  'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
+  'CERT_HAS_EXPIRED',
+  'ERR_TLS_CERT_ALTNAME_INVALID'
+]);
+
+function imapTraceEnabled() {
+  return process.env.ICLOUD_MCP_IMAP_TRACE === '1';
+}
+
+function safeToken(value, pattern) {
+  return typeof value === 'string' && pattern.test(value) ? value : '';
+}
+
+function classifyImapFailure(err, tcp) {
+  const message = typeof err?.message === 'string' ? err.message : '';
+  const code = safeToken(err?.code, /^[A-Z0-9_]+$/);
+  let stage = 'connection-failed';
+  if (message === TLS_EOF_BEFORE_SECURE) stage = 'tls-eof-before-secure';
+  else if (TLS_CERT_CODES.has(code)) stage = 'tls-certificate';
+  else if (err?.source === 'timeout-auth') stage = 'auth-timeout';
+  else if (err?.source === 'authentication' || message === 'UNAUTHORIZED') stage = 'auth-failed';
+  else if (err?.source === 'timeout') stage = 'connect-timeout';
+  else if (!tcp.connected) stage = 'before-tcp';
+  else stage = 'after-tcp';
+
+  let auth = 'not-reached';
+  if (stage === 'auth-failed') auth = 'failed';
+  else if (stage === 'auth-timeout') auth = 'waiting';
+
+  const family = tcp.remoteFamily === 'IPv4' || tcp.remoteFamily === 'IPv6' ? tcp.remoteFamily : '';
+  const remotePort = Number.isInteger(tcp.remotePort) ? tcp.remotePort : 0;
+
+  return {
+    stage,
+    code,
+    source: safeToken(err?.source, /^[a-z0-9-]+$/),
+    syscall: safeToken(err?.syscall, /^[a-z0-9_]+$/),
+    tcpConnected: tcp.connected === true,
+    remoteFamily: family,
+    remotePort,
+    auth
+  };
+}
+
+function emitImapTrace(info) {
+  if (!imapTraceEnabled()) return;
+  console.error(JSON.stringify({ imapTrace: true, ...info }));
+}
+
 /**
  * Create IMAP connection
  */
-function createConnection() {
+function createConnection(socket) {
   const creds = getCredentials();
-
-  return new Imap({
+  const options = {
     user: creds.email,
     password: creds.password,
     host: config.IMAP.HOST,
@@ -21,7 +80,10 @@ function createConnection() {
     tls: config.IMAP.TLS,
     authTimeout: config.IMAP.AUTH_TIMEOUT,
     connTimeout: config.IMAP.CONN_TIMEOUT
-  });
+  };
+  if (socket) options.socket = socket;
+
+  return new Imap(options);
 }
 
 /**
@@ -29,7 +91,27 @@ function createConnection() {
  */
 function withImap(operation) {
   return new Promise((resolve, reject) => {
-    const imap = createConnection();
+    const tcp = { connected: false, remoteFamily: '', remotePort: 0 };
+    let socket;
+    if (imapTraceEnabled()) {
+      socket = new net.Socket();
+      socket.once('connect', () => {
+        tcp.connected = true;
+        tcp.remoteFamily = socket.remoteFamily || '';
+        tcp.remotePort = socket.remotePort || 0;
+        emitImapTrace({
+          stage: 'tcp-connect',
+          code: '',
+          source: '',
+          syscall: '',
+          tcpConnected: true,
+          remoteFamily: tcp.remoteFamily === 'IPv4' || tcp.remoteFamily === 'IPv6' ? tcp.remoteFamily : '',
+          remotePort: Number.isInteger(tcp.remotePort) ? tcp.remotePort : 0,
+          auth: 'not-reached'
+        });
+      });
+    }
+    const imap = createConnection(socket);
 
     imap.once('ready', async () => {
       try {
@@ -43,10 +125,21 @@ function withImap(operation) {
     });
 
     imap.once('error', (err) => {
-      if (err.message?.includes('AUTHENTICATIONFAILED')) {
-        reject(new Error('UNAUTHORIZED'));
+      if (socket && (socket.remoteFamily === 'IPv4' || socket.remoteFamily === 'IPv6')) {
+        tcp.connected = true;
+        tcp.remoteFamily = socket.remoteFamily;
+        tcp.remotePort = socket.remotePort || 0;
+      }
+      const authFailed = typeof err.message === 'string' && err.message.includes('AUTHENTICATIONFAILED');
+      const reported = authFailed ? new Error('UNAUTHORIZED') : err;
+      const info = classifyImapFailure(authFailed
+        ? { message: 'UNAUTHORIZED', source: 'authentication', code: err.code }
+        : err, tcp);
+      emitImapTrace(info);
+      if (imapTraceEnabled()) {
+        reject(new Error('IMAP connection failed ' + JSON.stringify(info)));
       } else {
-        reject(err);
+        reject(reported);
       }
     });
 
