@@ -12,10 +12,15 @@ const { getCredentials } = require('../auth');
 function createTransporter() {
   const creds = getCredentials();
 
+  // Port 587 starts in clear and upgrades with STARTTLS. requireTLS makes a
+  // missing or refused upgrade fail the connection before AUTH. Certificate
+  // checks stay on even if NODE_TLS_REJECT_UNAUTHORIZED=0.
   return nodemailer.createTransport({
     host: config.SMTP.HOST,
     port: config.SMTP.PORT,
     secure: config.SMTP.SECURE,
+    requireTLS: true,
+    tls: { rejectUnauthorized: true },
     auth: {
       user: creds.email,
       pass: creds.password
